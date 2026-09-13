@@ -1,0 +1,6 @@
+# The tastytrade client uses only the standard library (see portfolio/tasty.py).
+yfinance>=0.2.40
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pywebview>=5.0
+python-dotenv>=1.0

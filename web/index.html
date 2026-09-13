@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portfolio Statistics</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>Portfolio Statistics</h1>
+    <div class="sub" id="accounts">Loading…</div>
+  </div>
+  <div class="topbar-right">
+    <label class="acctpick">
+      <span class="sub">Account</span>
+      <select id="account"></select>
+    </label>
+    <span class="sub" id="stamp"></span>
+    <button id="refresh" class="btn">Refresh</button>
+  </div>
+</header>
+
+<main id="main" hidden>
+  <section id="warnings" class="warnings" hidden></section>
+  <section id="empty" class="empty" hidden></section>
+
+  <section class="kpis" id="kpis"></section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Allocation</h2>
+      <div class="tabs" id="tabs">
+        <button class="tab is-active" data-key="by_symbol">By symbol</button>
+        <button class="tab" data-key="by_sector">By sector</button>
+        <button class="tab" data-key="by_industry">By industry</button>
+        <button class="tab" data-key="by_instrument_type">By type</button>
+      </div>
+      <div class="toggle" id="basis">
+        <button class="is-active" data-basis="pct_of_gross">Notional</button>
+        <button data-basis="pct_of_margin">Margin</button>
+      </div>
+    </div>
+    <div id="stack" class="stack"></div>
+    <div id="alloc"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Correlation</h2>
+      <span class="sub" id="corrmeta"></span>
+    </div>
+    <div id="corr"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>What if I added…</h2>
+      <span class="sub">Correlation of prospective symbols against this book</span>
+    </div>
+    <form id="whatif-form" class="whatif">
+      <input id="whatif-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="e.g. NVDA, TLT, GLD, /ES">
+      <button class="btn" type="submit">Analyse</button>
+    </form>
+    <div id="whatif"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Risk</h2>
+    <div class="riskgrid" id="risk"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Positions</h2>
+    <div class="tablewrap">
+      <table id="positions">
+        <thead><tr>
+          <th>Symbol</th><th>Type</th><th>Sector</th><th>Industry</th>
+          <th class="num">Qty</th><th class="num">Price</th><th class="num">Mult</th>
+          <th class="num">Market value</th><th class="num">Notional</th>
+          <th class="num">% gross</th><th class="num">Beta</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="status" class="status">Connecting to tastytrade…</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

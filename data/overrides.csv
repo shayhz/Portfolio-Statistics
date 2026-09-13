@@ -1,0 +1,6 @@
+symbol,sector,industry
+# Manual sector/industry overrides. These always win over the Yahoo lookup.
+# Useful for ETFs, ADRs, or anything that shows up as Unknown in the dashboard.
+# Example:
+# SPY,ETF / Fund,US Large Cap Blend
+# TLT,ETF / Fund,Long Government Bonds
