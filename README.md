@@ -62,8 +62,34 @@ Notional is computed per instrument type:
 
 Allocation percentages are shares of **gross** notional (the sum of absolute
 exposures), so a hedged book never produces percentages over 100%. The **Margin**
-toggle re-bases the same breakdown on actual margin requirement per underlying, which
-is the more meaningful denominator for a futures-heavy account.
+toggle re-bases the same breakdown on actual margin requirement per underlying.
+tastytrade's margin report covers equities only -- futures margin is reported once
+per account as `futures-margin-requirement`, so it is attributed across that
+account's futures positions in proportion to notional. Margin is tracked per
+(account, underlying), since the same name held in two accounts is two separate
+requirements.
+
+### Three bases for allocation: Notional / Risk / Margin
+
+Notional alone is misleading in a book that mixes futures with equities. A 10-year
+note future has roughly 4% annualised volatility; a micro-cap can run over 100%. Rated
+by notional, one `/ZN` contract looks like half the portfolio; rated by how much it can
+actually move, it is under a tenth of it:
+
+| | % notional | % risk | % margin | vol |
+|---|---|---|---|---|
+| `/ZN` | 53.8% | 8.1% | 6.9% | 4% |
+| CRSR | 4.4% | **14.8%** | 17.7% | 91% |
+| SNDK | 3.3% | **14.1%** | 6.5% | 116% |
+
+**Risk** weights each position by notional × annualised volatility, using the same
+daily returns the correlation matrix is built from. It is the honest denominator when
+asset classes differ: it moves Technology from 18.8% of the book to **48.2%**, and
+`Futures: Rates` from 53.8% down to 8.1%.
+
+The **Equities only** checkbox hides futures entirely — useful for looking at just the
+stock sleeve, but note it hides a real exposure rather than measuring it, so prefer the
+Risk basis for judging concentration.
 
 ### Risk panel
 
@@ -73,6 +99,32 @@ utilisation and maintenance excess, futures notional as a share of the book, and
 notional-weighted dividend yield, IV rank and SPY correlation. Beta, IV rank,
 correlation and dividend yield come from tastytrade's `/market-metrics`; futures have
 no beta there, so the beta-weighted figure reports what share of gross it covers.
+
+## Performance and P&L
+
+**Unrealized P&L** per position, rolled up by sector and industry and shown as a
+total, from `average-open-price` against the current mark. Signed quantity makes it
+correct for shorts: a short option whose premium has decayed shows a gain. Day P&L is
+measured against the previous close, not the open price. No extra API calls -- the
+fields are already in the positions response.
+
+**Net liq history** comes from `/accounts/{n}/net-liq/history`, giving an equity curve,
+peak-to-trough max drawdown with its dates, and period returns.
+
+Two caveats on the curve, both deliberate:
+
+- The endpoint returns one point per **calendar** day, so period returns are resolved
+  by date rather than by counting rows -- counting trading days would make "1y" reach
+  back only about eight months. A period is omitted entirely when the history does not
+  span it, rather than quietly measured against the oldest point available.
+- Net liquidating value moves with deposits and withdrawals, so these are *account
+  value* changes, not time-weighted investment returns.
+
+## Upcoming earnings
+
+Holdings reporting within 60 days, nearest first, flagged when the position includes
+options. The dates come from the `earnings` block of the `/market-metrics` response
+that is already fetched for beta and IV rank.
 
 ## Correlation matrix
 
@@ -151,7 +203,8 @@ tests/                  offline checks of the exposure math
 
 Run the tests with `.venv\Scripts\python.exe tests\test_analytics.py`.
 
-Your selected account, allocation tab and notional/margin toggle are remembered in
+Your selected account, allocation tab, allocation basis, equities-only toggle,
+positions-table sort and which panels you have collapsed are remembered in
 `data/ui_state.json`. They are stored server-side on purpose: the app falls back to a
 random port when 8765 is taken, and browser `localStorage` is scoped to the origin
 *including the port*, so a browser-side preference would not survive a restart.

@@ -89,7 +89,7 @@ main { padding: 20px; display: flex; flex-direction: column; gap: 16px;
        border-bottom: 1px solid var(--line); }
 /* By-symbol adds sector + industry columns. */
 .with-classification .row {
-  grid-template-columns: 130px 150px 190px 1fr 80px 110px 70px;
+  grid-template-columns: 120px 140px 175px 52px 1fr 78px 105px 68px;
 }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 #alloc:not(.with-classification) .row { cursor: default; }
@@ -240,3 +240,76 @@ td.num { font-variant-numeric: tabular-nums; }
                display: flex; align-items: center; justify-content: center; }
 .hstrip-cell span { font-size: 10px; font-weight: 600; color: var(--text);
                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.chk { display: flex; align-items: center; gap: 6px; font-size: 13px;
+       color: var(--muted); cursor: pointer; user-select: none; }
+.chk input { accent-color: var(--accent); cursor: pointer; }
+.chk:hover { color: var(--text); }
+
+/* The equities-only toggle governs every figure on the page, so make an active
+   filter unmistakable rather than a quiet checkbox in the header. */
+.chk.is-on { color: var(--warn); font-weight: 600; }
+body.ex-futures .topbar { box-shadow: inset 0 -2px 0 var(--warn); }
+
+/* ---------- equity curve ---------- */
+.curve-wrap { position: relative; }
+.curve { width: 100%; height: 190px; display: block; cursor: crosshair; }
+
+/* Hover readout: a vertical rule plus a marker on the series. */
+.crosshair { position: absolute; top: 0; bottom: 0; width: 1px;
+             background: var(--muted); opacity: .6; pointer-events: none; }
+.cdot { position: absolute; width: 9px; height: 9px; border-radius: 50%;
+        background: var(--text); border: 2px solid var(--bg);
+        transform: translate(-50%, -50%); pointer-events: none; }
+.ylab { position: absolute; right: 4px; font-size: 11px; pointer-events: none; }
+.ylab.hi { top: 2px; }
+.ylab.lo { bottom: 2px; }
+
+/* Date ticks are absolutely placed so they line up with their data point. */
+.xaxis { position: relative; height: 16px; margin-top: 6px; font-size: 11px;
+         color: var(--muted); }
+.xaxis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.xaxis span:first-child { transform: none; }
+.xaxis span:last-child { transform: translateX(-100%); }
+#perfstats { margin-top: 14px; }
+.riskitem .value.pos { color: var(--long); }
+.riskitem .value.neg { color: var(--short); }
+
+/* ---------- earnings ---------- */
+.earn { display: grid; grid-template-columns: 90px 110px 110px 1fr 110px;
+        align-items: center; gap: 12px; padding: 7px 0;
+        border-bottom: 1px solid var(--line); font-size: 13px; }
+.earn:last-child { border-bottom: 0; }
+.earn-sym { font-weight: 700; }
+.earn-when { font-variant-numeric: tabular-nums; }
+.earn-when.soon { color: var(--warn); font-weight: 600; }
+
+/* ---------- collapsible panels ---------- */
+.panel-head { cursor: pointer; user-select: none; }
+.panel-head > .tabs, .panel-head > .toggle, .panel-head > .acctpick { cursor: default; }
+.collapse {
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+  padding: 0; width: 16px; height: 16px; flex: none; font-size: 11px;
+  display: flex; align-items: center; justify-content: center;
+}
+.collapse::before { content: "▾"; transition: transform .12s ease; }
+.panel.collapsed .collapse::before { transform: rotate(-90deg); }
+.panel-head:hover .collapse { color: var(--text); }
+.panel.collapsed { padding-bottom: 14px; }
+.panel.collapsed > *:not(.panel-head) { display: none; }
+.panel.collapsed .panel-head { margin-bottom: 0; }
+
+/* ---------- sortable table headers ---------- */
+#positions th[data-sort] { cursor: pointer; user-select: none;
+                           position: relative; padding-right: 18px; }
+#positions th[data-sort]:hover { color: var(--text); }
+#positions th.sorted { color: var(--accent); }
+#positions th.sorted::after { content: "▾"; position: absolute; right: 6px;
+                              font-size: 9px; }
+#positions th.sorted.asc::after { content: "▴"; }
+
+/* ---------- earnings urgency ---------- */
+.earn.urgent { background: rgba(248, 81, 73, .10); border-radius: 6px;
+               padding-left: 8px; padding-right: 8px; }
+.earn.urgent .earn-sym, .earn.urgent .earn-when { color: var(--short); }
+.earn.near .earn-when { color: var(--warn); }

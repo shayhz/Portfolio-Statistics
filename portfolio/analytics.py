@@ -56,12 +56,49 @@ class Position:
     industry: str = "Unknown"
     beta: Decimal | None = None
     margin: Decimal = ZERO
+    volatility: Decimal | None = None  # annualised, as a fraction
+    average_open_price: Decimal = ZERO
+    prev_close: Decimal | None = None
+    earnings_date: str | None = None
     expires_at: str | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
     def gross_notional(self) -> Decimal:
         return abs(self.notional)
+
+    @property
+    def risk(self) -> Decimal:
+        """Volatility-adjusted exposure: notional scaled by how much the
+        underlying actually moves. Without this a Treasury future and a
+        micro-cap look equivalent per dollar of notional, which they are not."""
+        if self.volatility is None:
+            return ZERO
+        return self.gross_notional * self.volatility
+
+    @property
+    def cost_basis(self) -> Decimal:
+        """What the position cost to put on, always positive."""
+        return abs(self.average_open_price * self.quantity * self.multiplier)
+
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        """Signed quantity makes this work for shorts too: a short gains when
+        the mark falls below the price it was opened at."""
+        if not self.average_open_price:
+            return ZERO
+        return (self.price - self.average_open_price) * self.quantity * self.multiplier
+
+    @property
+    def day_pnl(self) -> Decimal:
+        """Change since the previous close, not since the position was opened."""
+        if self.prev_close is None:
+            return ZERO
+        return (self.price - self.prev_close) * self.quantity * self.multiplier
+
+    @property
+    def is_future(self) -> bool:
+        return self.instrument_type in FUTURE_LIKE or self.instrument_type in FUTURE_OPTION_LIKE
 
 
 def _f(value: Decimal | None) -> float | None:
@@ -119,6 +156,7 @@ class PortfolioBuilder:
         raw_positions: list[dict] = []
         balances: list[dict] = []
         margin_by_account: dict[str, dict] = {}
+        history_by_account: dict[str, list] = {}
 
         for acct in accounts:
             number = acct["account_number"]
@@ -129,9 +167,10 @@ class PortfolioBuilder:
                 pos["_account"] = number
                 raw_positions.append(pos)
             margin_by_account[number] = self.client.margin_requirements(number)
+            history_by_account[number] = self.client.net_liq_history(number)
 
         self._load_reference_data(raw_positions)
-        margins = self._margin_by_underlying(margin_by_account)
+        margins = self._margin_by_underlying(margin_by_account, balances, raw_positions)
 
         positions = [self._build_position(raw, margins) for raw in raw_positions]
         positions = [p for p in positions if p.quantity != 0]
@@ -145,17 +184,39 @@ class PortfolioBuilder:
         except Exception as exc:  # noqa: BLE001 - correlation is not worth failing over
             log.warning("Correlation data unavailable: %s", exc)
 
+        # Volatility drives the risk basis, so attach it once per position.
+        vols: dict[str, Decimal | None] = {}
+        for pos in positions:
+            if pos.group_key not in vols:
+                try:
+                    value = self.prices.volatility_for(pos.group_key)
+                except Exception:  # noqa: BLE001
+                    value = None
+                vols[pos.group_key] = Decimal(str(value)) if value else None
+            pos.volatility = vols[pos.group_key]
+
         # One fully-computed view per account plus a combined one, so the UI can
         # switch accounts without re-querying the API. Allocation percentages are
         # only meaningful within a single view, so they cannot be derived on the
         # client by filtering the combined one.
-        views = {"ALL": self._assemble(accounts, balances, positions)}
+        equities_only = [p for p in positions if not p.is_future]
+
+        all_history = _combine_history(history_by_account)
+        views = {"ALL": self._assemble(accounts, balances, positions, all_history)}
+        views_ex_futures = {
+            "ALL": self._assemble(accounts, balances, equities_only, all_history)
+        }
         for acct in accounts:
             number = acct["account_number"]
+            acct_balances = [b for b in balances if b.get("account_number") == number]
+            acct_history = _combine_history({number: history_by_account.get(number, [])})
             views[number] = self._assemble(
-                [acct],
-                [b for b in balances if b.get("account_number") == number],
-                [p for p in positions if p.account == number],
+                [acct], acct_balances, [p for p in positions if p.account == number],
+                acct_history,
+            )
+            views_ex_futures[number] = self._assemble(
+                [acct], acct_balances,
+                [p for p in equities_only if p.account == number], acct_history,
             )
 
         return {
@@ -181,6 +242,10 @@ class PortfolioBuilder:
                 for a in accounts
             ],
             "views": views,
+            # Same shape, with futures and futures options removed, for the
+            # "equities only" toggle in the UI.
+            "views_ex_futures": views_ex_futures,
+            "has_futures": bool(positions) and len(equities_only) != len(positions),
         }
 
     def _load_reference_data(self, raw_positions: list[dict]) -> None:
@@ -217,17 +282,53 @@ class PortfolioBuilder:
                 log.warning("Future instrument lookup failed for %s: %s", symbol, exc)
 
     @staticmethod
-    def _margin_by_underlying(margin_by_account: dict[str, dict]) -> dict[str, Decimal]:
-        """Flatten the per-account margin reports into underlying -> requirement."""
-        out: dict[str, Decimal] = defaultdict(Decimal)
-        for report in margin_by_account.values():
+    def _margin_by_underlying(
+        margin_by_account: dict[str, dict],
+        balances: list[dict],
+        raw_positions: list[dict],
+    ) -> dict[tuple[str, str], Decimal]:
+        """Margin requirement keyed by (account, underlying).
+
+        Keyed per account because the same underlying can be held in several
+        accounts with different requirements; a single underlying -> margin map
+        would credit one account with another's margin.
+
+        tastytrade's margin report covers equities only -- futures margin is
+        reported once per account as `futures-margin-requirement`, so it is
+        attributed across that account's futures positions in proportion to
+        notional. With a single futures position the split is exact.
+        """
+        out: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+
+        for account, report in margin_by_account.items():
             for group in report.get("groups") or []:
                 if not isinstance(group, dict):
                     continue
                 underlying = (group.get("underlying_symbol") or "").strip()
                 if not underlying:
                     continue
-                out[underlying] += abs(dec(group.get("margin_requirement")))
+                out[(account, underlying)] += abs(dec(group.get("margin_requirement")))
+
+        for balance in balances:
+            account = balance.get("account_number") or ""
+            futures_margin = abs(dec(balance.get("futures_margin_requirement")))
+            if not futures_margin:
+                continue
+            futures = [
+                p for p in raw_positions
+                if p.get("_account") == account
+                and (p.get("instrument_type") or "") in (FUTURE_LIKE | FUTURE_OPTION_LIKE)
+            ]
+            weights: dict[str, Decimal] = defaultdict(Decimal)
+            for pos in futures:
+                underlying = (pos.get("underlying_symbol") or pos.get("symbol") or "").strip()
+                weights[underlying] += abs(dec(pos.get("quantity"))) or Decimal(1)
+            total = sum(weights.values(), ZERO)
+            if not total:
+                continue
+            for underlying, weight in weights.items():
+                out[(account, underlying)] += futures_margin * weight / total
+
         return dict(out)
 
     # ------------------------------------------------------------ per position
@@ -271,7 +372,9 @@ class PortfolioBuilder:
         )
         return Decimal(1)
 
-    def _build_position(self, raw: dict, margins: dict[str, Decimal]) -> Position:
+    def _build_position(
+        self, raw: dict, margins: dict[tuple[str, str], Decimal]
+    ) -> Position:
         warnings: list[str] = []
         itype = raw.get("instrument_type") or "Unknown"
         symbol = (raw.get("symbol") or "").strip()
@@ -332,6 +435,10 @@ class PortfolioBuilder:
         elif self._quotes.get(underlying, {}).get("beta") is not None:
             beta = dec(self._quotes[underlying]["beta"], ZERO)
 
+        earnings_date = None
+        if metric and isinstance(metric.get("earnings"), dict):
+            earnings_date = metric["earnings"].get("expected_report_date")
+
         expires = raw.get("expires_at")
 
         return Position(
@@ -349,7 +456,10 @@ class PortfolioBuilder:
             sector=sector,
             industry=industry,
             beta=beta,
-            margin=margins.get(underlying, ZERO),
+            margin=margins.get((raw.get("_account", ""), underlying), ZERO),
+            average_open_price=dec(raw.get("average_open_price")),
+            prev_close=dec(raw.get("close_price")) if raw.get("close_price") is not None else None,
+            earnings_date=earnings_date,
             expires_at=str(expires) if expires else None,
             warnings=warnings,
         )
@@ -357,25 +467,37 @@ class PortfolioBuilder:
     # -------------------------------------------------------------- assembly
 
     def _assemble(
-        self, accounts: list[dict], balances: list[dict], positions: list[Position]
+        self,
+        accounts: list[dict],
+        balances: list[dict],
+        positions: list[Position],
+        history: list[dict] | None = None,
     ) -> dict:
         totals = _totals(balances)
         gross = sum((p.gross_notional for p in positions), ZERO)
         net = sum((p.notional for p in positions), ZERO)
 
-        # Margin is reported per underlying, so credit it once per group.
-        margin_by_group: dict[str, Decimal] = {}
+        # Margin is reported once per (account, underlying), so de-duplicate on
+        # that pair before summing -- stock and its options share one figure,
+        # but the same underlying in two accounts is two separate requirements.
+        per_pair: dict[tuple[str, str], Decimal] = {}
         for pos in positions:
-            margin_by_group.setdefault(pos.group_key, ZERO)
-            margin_by_group[pos.group_key] = max(margin_by_group[pos.group_key], pos.margin)
+            per_pair[(pos.account, pos.group_key)] = pos.margin
+        margin_by_group: dict[str, Decimal] = defaultdict(Decimal)
+        for (_account, key), value in per_pair.items():
+            margin_by_group[key] += value
+        margin_by_group = dict(margin_by_group)
         total_margin = sum(margin_by_group.values(), ZERO)
 
-        by_symbol = _group(positions, lambda p: p.group_key, gross, margin_by_group, total_margin)
-        by_sector = _group(positions, lambda p: p.sector, gross, margin_by_group, total_margin)
-        by_industry = _group(positions, lambda p: p.industry, gross, margin_by_group, total_margin)
-        by_type = _group(
-            positions, lambda p: p.instrument_type, gross, margin_by_group, total_margin
-        )
+        total_risk = sum((p.risk for p in positions), ZERO)
+
+        def grp(key_fn):
+            return _group(positions, key_fn, gross, margin_by_group, total_margin, total_risk)
+
+        by_symbol = grp(lambda p: p.group_key)
+        by_sector = grp(lambda p: p.sector)
+        by_industry = grp(lambda p: p.industry)
+        by_type = grp(lambda p: p.instrument_type)
 
         warnings = sorted({w for p in positions for w in p.warnings})
 
@@ -403,12 +525,17 @@ class PortfolioBuilder:
                 "long_notional": float(sum((p.notional for p in positions if p.notional > 0), ZERO)),
                 "short_notional": float(sum((p.notional for p in positions if p.notional < 0), ZERO)),
                 "total_margin": float(total_margin),
+                "total_risk": float(total_risk),
             },
             "risk": {
                 **_risk(positions, totals, gross, net, total_margin, self._metrics, self._quotes),
                 "average_correlation": correlation.get("average_correlation"),
+                "total_risk": float(total_risk),
+                "risk_pct_of_net_liq": _pct(total_risk, Decimal(str(totals["net_liquidating_value"]))),
             },
             "correlation": correlation,
+            "performance": _performance(history or [], positions),
+            "earnings": _upcoming_earnings(positions),
             "allocation": {
                 "by_symbol": by_symbol,
                 "by_sector": by_sector,
@@ -433,6 +560,16 @@ class PortfolioBuilder:
                     "industry": p.industry,
                     "beta": _f(p.beta),
                     "margin": _f(p.margin),
+                    "volatility_pct": float(p.volatility * 100) if p.volatility is not None else None,
+                    "risk": _f(p.risk),
+                    "average_open_price": _f(p.average_open_price),
+                    "cost_basis": _f(p.cost_basis),
+                    "unrealized_pnl": _f(p.unrealized_pnl),
+                    "unrealized_pnl_pct": _pct(p.unrealized_pnl, p.cost_basis),
+                    "day_pnl": _f(p.day_pnl),
+                    "earnings_date": p.earnings_date,
+                    "pct_of_risk": _pct(p.risk, total_risk),
+                    "is_future": p.is_future,
                     "expires_at": p.expires_at,
                 }
                 for p in sorted(positions, key=lambda p: -p.gross_notional)
@@ -478,6 +615,7 @@ def _group(
     gross: Decimal,
     margin_by_group: dict[str, Decimal],
     total_margin: Decimal,
+    total_risk: Decimal,
 ) -> list[dict]:
     buckets: dict[str, list[Position]] = defaultdict(list)
     for pos in positions:
@@ -487,6 +625,11 @@ def _group(
     for name, group in buckets.items():
         group_gross = sum((p.gross_notional for p in group), ZERO)
         group_net = sum((p.notional for p in group), ZERO)
+        group_risk = sum((p.risk for p in group), ZERO)
+        group_cost = sum((p.cost_basis for p in group), ZERO)
+        group_pnl = sum((p.unrealized_pnl for p in group), ZERO)
+        # Notional-weighted volatility of the bucket's underlyings.
+        group_vol = (group_risk / group_gross) if group_gross else None
         # Sum margin over the distinct underlyings represented in this bucket.
         margin = sum(
             (margin_by_group.get(k, ZERO) for k in {p.group_key for p in group}), ZERO
@@ -520,6 +663,12 @@ def _group(
                 "pct_of_gross": _pct(group_gross, gross),
                 "margin": float(margin),
                 "pct_of_margin": _pct(margin, total_margin),
+                "risk": float(group_risk),
+                "pct_of_risk": _pct(group_risk, total_risk),
+                "volatility_pct": float(group_vol * 100) if group_vol is not None else None,
+                "unrealized_pnl": float(group_pnl),
+                "unrealized_pnl_pct": _pct(group_pnl, group_cost),
+                "day_pnl": float(sum((p.day_pnl for p in group), ZERO)),
                 "position_count": len(group),
                 "direction": "Long" if group_net > 0 else "Short" if group_net < 0 else "Flat",
                 # Present when every position in the bucket agrees, which is
@@ -627,3 +776,161 @@ def _risk(
 
 def build_report(client: TastyClient, account_numbers: list[str] | None = None) -> dict:
     return PortfolioBuilder(client).build(account_numbers)
+
+
+def _combine_history(history_by_account: dict[str, list]) -> list[dict]:
+    """Merge per-account net-liq series into one portfolio curve.
+
+    Accounts can start on different dates and skip days, so each account's last
+    known value is carried forward and the accounts are summed per date. Without
+    the carry-forward, a day missing from one account would look like a crash in
+    the combined curve.
+    """
+    per_account: dict[str, dict[str, Decimal]] = {}
+    all_dates: set[str] = set()
+    for account, points in history_by_account.items():
+        series: dict[str, Decimal] = {}
+        for point in points or []:
+            stamp = (point.get("time") or "")[:10]
+            if not stamp:
+                continue
+            series[stamp] = dec(point.get("close"))
+            all_dates.add(stamp)
+        if series:
+            per_account[account] = series
+
+    if not per_account:
+        return []
+
+    out: list[dict] = []
+    last: dict[str, Decimal] = {}
+    for stamp in sorted(all_dates):
+        total = ZERO
+        for account, series in per_account.items():
+            if stamp in series:
+                last[account] = series[stamp]
+            if account in last:
+                total += last[account]
+        out.append({"date": stamp, "value": float(total)})
+    return out
+
+
+def _performance(history: list[dict], positions: list[Position]) -> dict:
+    """Equity curve statistics plus current unrealized P&L."""
+    cost = sum((p.cost_basis for p in positions), ZERO)
+    unrealized = sum((p.unrealized_pnl for p in positions), ZERO)
+    day = sum((p.day_pnl for p in positions), ZERO)
+
+    winners = [p for p in positions if p.unrealized_pnl > 0]
+    losers = [p for p in positions if p.unrealized_pnl < 0]
+    best = max(positions, key=lambda p: p.unrealized_pnl, default=None)
+    worst = min(positions, key=lambda p: p.unrealized_pnl, default=None)
+
+    stats = {
+        "cost_basis": float(cost),
+        "unrealized_pnl": float(unrealized),
+        "unrealized_pnl_pct": _pct(unrealized, cost),
+        "day_pnl": float(day),
+        "winners": len(winners),
+        "losers": len(losers),
+        "best": {"symbol": best.symbol, "pnl": _f(best.unrealized_pnl)} if best else None,
+        "worst": {"symbol": worst.symbol, "pnl": _f(worst.unrealized_pnl)} if worst else None,
+        "history": history,
+    }
+
+    values = [h["value"] for h in history if h["value"] > 0]
+    if len(values) < 2:
+        return {**stats, "max_drawdown_pct": None, "returns": {}}
+
+    # Peak-to-trough on the daily closes.
+    peak = values[0]
+    max_dd = 0.0
+    peak_date = trough_date = None
+    running_peak_date = history[0]["date"]
+    for point in history:
+        value = point["value"]
+        if value <= 0:
+            continue
+        if value > peak:
+            peak = value
+            running_peak_date = point["date"]
+        drawdown = (value / peak - 1) * 100 if peak else 0.0
+        if drawdown < max_dd:
+            max_dd = drawdown
+            peak_date, trough_date = running_peak_date, point["date"]
+
+    current = values[-1]
+
+    # tastytrade returns one point per *calendar* day, so periods are looked up
+    # by date rather than by counting rows -- counting trading days here would
+    # make "1y" reach back only about eight months.
+    from datetime import date as _date, timedelta as _timedelta
+
+    usable = [h for h in history if h["value"] > 0]
+    try:
+        end = _date.fromisoformat(usable[-1]["date"])
+    except (ValueError, IndexError):
+        end = None
+
+    returns = {}
+    if end:
+        for label, days in (("1m", 30), ("3m", 91), ("6m", 182), ("1y", 365)):
+            target = end - _timedelta(days=days)
+            prior = [h for h in usable if _date.fromisoformat(h["date"]) <= target]
+            if not prior:
+                continue
+            # Only report a period the history actually spans: the oldest point
+            # must be close to the target, not months short of it.
+            gap = (target - _date.fromisoformat(prior[-1]["date"])).days
+            if gap > 10:
+                continue
+            start = prior[-1]["value"]
+            if start:
+                returns[label] = round((current / start - 1) * 100, 2)
+
+    return {
+        **stats,
+        "start_value": values[0],
+        "current_value": current,
+        "peak_value": max(values),
+        "max_drawdown_pct": round(max_dd, 2),
+        "max_drawdown_peak_date": peak_date,
+        "max_drawdown_trough_date": trough_date,
+        "returns": returns,
+    }
+
+
+def _upcoming_earnings(positions: list[Position], days_ahead: int = 60) -> list[dict]:
+    """Holdings reporting earnings soon, nearest first.
+
+    Relevant for short premium: an earnings print inside the life of a short
+    option is the main scheduled gap risk in an equity book.
+    """
+    from datetime import date as _date
+
+    today = _date.today()
+    by_symbol: dict[str, dict] = {}
+    for pos in positions:
+        if not pos.earnings_date:
+            continue
+        try:
+            when = _date.fromisoformat(pos.earnings_date)
+        except ValueError:
+            continue
+        delta = (when - today).days
+        if delta < 0 or delta > days_ahead:
+            continue
+        row = by_symbol.setdefault(
+            pos.group_key,
+            {
+                "symbol": pos.group_key,
+                "date": pos.earnings_date,
+                "days_away": delta,
+                "gross_notional": 0.0,
+                "has_options": False,
+            },
+        )
+        row["gross_notional"] += float(pos.gross_notional)
+        if "Option" in pos.instrument_type:
+            row["has_options"] = True
+    return sorted(by_symbol.values(), key=lambda r: (r["days_away"], -r["gross_notional"]))

@@ -331,3 +331,13 @@ class TastyClient:
             except TastytradeError as exc:
                 log.warning("market-data failed for chunk %s: %s", chunk, exc)
         return out
+
+    def net_liq_history(self, account_number: str, time_back: str = "1y") -> list[dict]:
+        """Daily net liquidating value history (OHLC per day)."""
+        try:
+            return self._get_items(
+                f"/accounts/{account_number}/net-liq/history", {"time-back": time_back}
+            )
+        except TastytradeError as exc:
+            log.warning("Net liq history unavailable for %s: %s", account_number, exc)
+            return []

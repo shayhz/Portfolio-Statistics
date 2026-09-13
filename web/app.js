@@ -10,11 +10,16 @@ let REPORT = null; // the currently selected view
 let account = "ALL";
 let tabKey = "by_symbol";
 let basis = "pct_of_gross";
+let exFutures = false;
 
 // Preferences live on the server, not in localStorage: the app serves on a
 // different port each launch when 8765 is taken, and localStorage is scoped to
 // the origin *including the port*, so it would not survive a restart.
-let PREFS = { account: "ALL", tab: "by_symbol", basis: "pct_of_gross" };
+let PREFS = { account: "ALL", tab: "by_symbol", basis: "pct_of_gross",
+              ex_futures: false, sort: "notional", sort_dir: "desc", collapsed: [] };
+let sortKey = "notional";
+let sortDir = "desc";
+let collapsed = new Set();
 
 async function loadPrefs() {
   try {
@@ -24,6 +29,10 @@ async function loadPrefs() {
   account = PREFS.account;
   tabKey = PREFS.tab;
   basis = PREFS.basis;
+  exFutures = !!PREFS.ex_futures;
+  sortKey = PREFS.sort || "notional";
+  sortDir = PREFS.sort_dir === "asc" ? "asc" : "desc";
+  collapsed = new Set(Array.isArray(PREFS.collapsed) ? PREFS.collapsed : []);
 }
 
 let saveTimer = null;
@@ -66,7 +75,7 @@ const signClass = (n) => (n > 0 ? "pos" : n < 0 ? "neg" : "dim");
 // ---------------------------------------------------------------- rendering
 
 function renderKpis(r) {
-  const c = r.cash, e = r.exposure, k = r.risk;
+  const c = r.cash, e = r.exposure, k = r.risk, pf = r.performance || {};
   const items = [
     { label: "Net liquidating value", value: exact(c.net_liquidating_value) },
     { label: "Cash available", value: exact(c.cash_balance),
@@ -82,6 +91,12 @@ function renderKpis(r) {
       note: `equity: ${exact(c.equity_buying_power)}` },
     { label: "Beta-weighted exposure", value: exact(k.beta_weighted_notional),
       note: `${pct(k.beta_weighted_pct_of_net_liq)} of net liq · ${pct(k.beta_coverage_pct, 0)} covered` },
+    { label: "Unrealized P&L", value: exact(pf.unrealized_pnl),
+      note: `${pct(pf.unrealized_pnl_pct)} on ${exact(pf.cost_basis)} cost · ${pf.winners}W / ${pf.losers}L`,
+      cls: pf.unrealized_pnl >= 0 ? "good" : "bad" },
+    { label: "Day P&L", value: exact(pf.day_pnl),
+      note: pf.best ? `best ${pf.best.symbol} ${exact(pf.best.pnl)} · worst ${pf.worst.symbol} ${exact(pf.worst.pnl)}` : "",
+      cls: pf.day_pnl >= 0 ? "good" : "bad" },
     { label: "Positions", value: String(r.positions.length),
       note: `${k.distinct_underlyings} underlyings · ${k.option_position_count} options · ${k.future_position_count} futures` },
   ];
@@ -109,16 +124,18 @@ function renderAllocation() {
                          title="${esc(r.name)}: ${pct(r[basis])}"></div>`)
     .join("");
 
-  const valueKey = basis === "pct_of_margin" ? "margin" : "gross_notional";
+  const valueKey = basis === "pct_of_margin" ? "margin"
+    : basis === "pct_of_risk" ? "risk" : "gross_notional";
   const alloc = $("#alloc");
   alloc.classList.toggle("with-classification", showClassification);
 
-  const basisLabel = basis === "pct_of_margin" ? "Margin" : "Notional";
+  const basisLabel = basis === "pct_of_margin" ? "Margin"
+    : basis === "pct_of_risk" ? "Risk" : "Notional";
   const header = `
     <div class="row head">
       <div>${showClassification ? "Symbol" : tabKey === "by_sector" ? "Sector"
             : tabKey === "by_industry" ? "Industry" : "Type"}</div>
-      ${showClassification ? "<div>Sector</div><div>Industry</div>" : ""}
+      ${showClassification ? "<div>Sector</div><div>Industry</div><div class=\"num\">Vol</div>" : ""}
       <div></div>
       <div class="num">% ${basisLabel.toLowerCase()}</div>
       <div class="num">${basisLabel}</div>
@@ -133,6 +150,7 @@ function renderAllocation() {
       ${showClassification ? `
         <div class="dim clip" title="${esc(r.sector || "")}">${esc(r.sector || "—")}</div>
         <div class="dim clip" title="${esc(r.industry || "")}">${esc(r.industry || "—")}</div>
+        <div class="num dim" title="annualised volatility">${r.volatility_pct === null || r.volatility_pct === undefined ? "—" : r.volatility_pct.toFixed(0) + "%"}</div>
       ` : ""}
       <div class="bar">
         <span style="width:${(r[basis] / max) * 100}%;background:${colorFor(i)}"></span>
@@ -255,6 +273,144 @@ function corrColor(v) {
     : `rgba(57, 197, 207, ${alpha})`;
 }
 
+function renderPerformance(r) {
+  const pf = r.performance || {};
+  const pts = pf.history || [];
+  const host = $("#curve");
+  const meta = $("#perfmeta");
+
+  if (pts.length < 2) {
+    meta.textContent = "";
+    host.innerHTML = `<div class="empty">No net liquidating value history for this account.</div>`;
+    host.__pts = null;
+  } else {
+    const W = 1000, H = 190, pad = 6;
+    const vals = pts.map((p) => p.value);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const span = hi - lo || 1;
+    const x = (i) => (i / (pts.length - 1)) * W;
+    const y = (v) => pad + (1 - (v - lo) / span) * (H - pad * 2);
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join("");
+    const up = vals[vals.length - 1] >= vals[0];
+    const stroke = up ? "var(--long)" : "var(--short)";
+
+    meta.textContent = `${pts[0].date} → ${pts[pts.length - 1].date} · ${pts.length} days`;
+    // Roughly six evenly spaced date ticks, always including both ends.
+    const ticks = [];
+    const want = Math.min(6, pts.length);
+    for (let t = 0; t < want; t++) {
+      const i = Math.round((t / (want - 1)) * (pts.length - 1));
+      ticks.push({ i, date: pts[i].date, left: (i / (pts.length - 1)) * 100 });
+    }
+
+    host.innerHTML = `
+      <div class="curve-wrap" id="curvewrap">
+        <svg class="curve" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+             aria-label="Net liquidating value over time">
+          <defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${stroke}" stop-opacity="0.28"/>
+            <stop offset="100%" stop-color="${stroke}" stop-opacity="0"/>
+          </linearGradient></defs>
+          <path d="${line}L${W},${H}L0,${H}Z" fill="url(#cg)"/>
+          <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2"
+                vector-effect="non-scaling-stroke"/>
+        </svg>
+        <div class="crosshair" id="crosshair" hidden></div>
+        <div class="cdot" id="cdot" hidden></div>
+        <div class="ylab hi dim">${exact(hi)}</div>
+        <div class="ylab lo dim">${exact(lo)}</div>
+      </div>
+      <div class="xaxis">
+        ${ticks.map((t) => `<span style="left:${t.left}%">${t.date.slice(2)}</span>`).join("")}
+      </div>`;
+
+    // Kept for the hover handler: value lookup plus the y-scale to place the dot.
+    host.__pts = pts;
+    host.__scale = { lo, span, pad, H };
+  }
+
+  const ret = pf.returns || {};
+  const retCell = (k) => ret[k] === undefined ? "—"
+    : `<span class="${ret[k] >= 0 ? "pos" : "neg"}">${ret[k] >= 0 ? "+" : ""}${ret[k].toFixed(1)}%</span>`;
+  $("#perfstats").innerHTML = `
+    <div class="riskitem">
+      <div class="label">Net liq return</div>
+      <div class="value" style="font-size:15px">
+        1m ${retCell("1m")} · 3m ${retCell("3m")} · 6m ${retCell("6m")} · 1y ${retCell("1y")}
+      </div>
+      <div class="hint">Change in net liquidating value, which includes deposits and withdrawals.</div>
+    </div>
+    <div class="riskitem">
+      <div class="label">Max drawdown</div>
+      <div class="value ${pf.max_drawdown_pct !== null && pf.max_drawdown_pct < -10 ? "neg" : ""}">
+        ${pf.max_drawdown_pct === null || pf.max_drawdown_pct === undefined ? "—" : pf.max_drawdown_pct.toFixed(1) + "%"}</div>
+      <div class="hint">${pf.max_drawdown_peak_date
+        ? `Peak ${pf.max_drawdown_peak_date} → trough ${pf.max_drawdown_trough_date}` : "Largest peak-to-trough fall."}</div>
+    </div>
+    <div class="riskitem">
+      <div class="label">Unrealized P&L</div>
+      <div class="value ${pf.unrealized_pnl >= 0 ? "pos" : "neg"}">${exact(pf.unrealized_pnl)}</div>
+      <div class="hint">${pct(pf.unrealized_pnl_pct)} on ${exact(pf.cost_basis)} of cost basis.</div>
+    </div>`;
+}
+
+// Hovering the curve reports the exact day rather than making you eyeball it.
+document.addEventListener("mousemove", (e) => {
+  const host = $("#curve");
+  const wrap = e.target.closest ? e.target.closest("#curvewrap") : null;
+  const cross = $("#crosshair"), dot = $("#cdot");
+  if (!wrap || !host.__pts) {
+    if (cross) cross.hidden = true;
+    if (dot) dot.hidden = true;
+    if (tip.dataset.owner === "curve") tip.hidden = true;
+    return;
+  }
+  const pts = host.__pts;
+  const rect = wrap.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const i = Math.round(ratio * (pts.length - 1));
+  const point = pts[i];
+  const { lo, span, pad, H } = host.__scale;
+  const yFrac = (pad + (1 - (point.value - lo) / span) * (H - pad * 2)) / H;
+
+  cross.hidden = false;
+  cross.style.left = `${(i / (pts.length - 1)) * 100}%`;
+  dot.hidden = false;
+  dot.style.left = `${(i / (pts.length - 1)) * 100}%`;
+  dot.style.top = `${yFrac * 100}%`;
+
+  const prev = i > 0 ? pts[i - 1].value : point.value;
+  const chg = point.value - prev;
+  tip.dataset.owner = "curve";
+  tip.innerHTML = `
+    <div class="tip-head">${esc(point.date)}</div>
+    <div class="tip-row" style="grid-template-columns:auto 1fr">
+      <span class="dim">Net liq</span><span class="num"><b>${exact(point.value)}</b></span>
+    </div>
+    <div class="tip-row" style="grid-template-columns:auto 1fr">
+      <span class="dim">Day change</span>
+      <span class="num ${chg >= 0 ? "pos" : "neg"}">${chg >= 0 ? "+" : ""}${exact(chg)}</span>
+    </div>`;
+  tip.hidden = false;
+  moveTip(e);
+});
+
+function renderEarnings(r) {
+  const rows = r.earnings || [];
+  $("#earnpanel").hidden = rows.length === 0;
+  if (!rows.length) return;
+  $("#earnings").innerHTML = rows.map((e) => `
+    <div class="earn ${e.days_away <= 7 ? "urgent" : e.days_away <= 14 ? "near" : ""}">
+      <span class="earn-sym">${esc(e.symbol)}</span>
+      <span class="earn-when">${e.date}</span>
+      <span>${e.days_away === 0 ? '<span class="badge Short">TODAY</span>'
+        : e.days_away <= 7 ? `<span class="badge Short">in ${e.days_away}d</span>`
+        : `<span class="dim">in ${e.days_away} days</span>`}</span>
+      <span class="num dim">${exact(e.gross_notional)}</span>
+      <span>${e.has_options ? '<span class="badge Short">has options</span>' : ""}</span>
+    </div>`).join("");
+}
+
 function renderCorrelation(r) {
   const c = r.correlation || {};
   const meta = $("#corrmeta");
@@ -318,8 +474,34 @@ function renderCorrelation(r) {
     </div>`;
 }
 
+function sortPositions(rows) {
+  const dir = sortDir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const x = a[sortKey], y = b[sortKey];
+    // Missing values always sink, whichever way the column is sorted.
+    if (x === null || x === undefined) return 1;
+    if (y === null || y === undefined) return -1;
+    if (typeof x === "string" || typeof y === "string") {
+      return String(x).localeCompare(String(y)) * dir;
+    }
+    return (x - y) * dir;
+  });
+}
+
+function syncSortHeaders() {
+  document.querySelectorAll("#positions th[data-sort]").forEach((th) => {
+    const active = th.dataset.sort === sortKey;
+    th.classList.toggle("sorted", active);
+    th.classList.toggle("asc", active && sortDir === "asc");
+  });
+}
+
 function renderPositions(r) {
-  $("#positions tbody").innerHTML = r.positions.map((p) => `
+  const rows = sortPositions(r.positions);
+  const meta = $("#posmeta");
+  if (meta) meta.textContent = `${rows.length} positions · click a column to sort`;
+  syncSortHeaders();
+  $("#positions tbody").innerHTML = rows.map((p) => `
     <tr>
       <td><strong>${p.symbol}</strong></td>
       <td class="dim">${p.instrument_type}</td>
@@ -331,9 +513,52 @@ function renderPositions(r) {
       <td class="num ${signClass(p.market_value)}">${exact(p.market_value)}</td>
       <td class="num ${signClass(p.notional)}">${exact(p.notional)}</td>
       <td class="num">${pct(p.pct_of_gross)}</td>
+      <td class="num ${signClass(p.unrealized_pnl)}">${exact(p.unrealized_pnl)}</td>
+      <td class="num ${signClass(p.unrealized_pnl)}">${pct(p.unrealized_pnl_pct)}</td>
       <td class="num dim">${num(p.beta)}</td>
     </tr>`).join("");
 }
+
+document.querySelectorAll("#positions th[data-sort]").forEach((th) => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    if (key === sortKey) {
+      sortDir = sortDir === "asc" ? "desc" : "asc";
+    } else {
+      sortKey = key;
+      // Text reads naturally A-Z; numbers are almost always wanted largest first.
+      sortDir = th.classList.contains("num") ? "desc" : "asc";
+    }
+    savePrefs({ sort: sortKey, sort_dir: sortDir });
+    if (REPORT) renderPositions(REPORT);
+  });
+});
+
+// ------------------------------------------------------------- collapsing
+
+function applyCollapsed() {
+  document.querySelectorAll("section.panel[data-panel]").forEach((panel) => {
+    panel.classList.toggle("collapsed", collapsed.has(panel.dataset.panel));
+  });
+}
+
+document.querySelectorAll("section.panel[data-panel]").forEach((panel) => {
+  const head = panel.querySelector(".panel-head");
+  if (!head) return;
+  const btn = document.createElement("button");
+  btn.className = "collapse";
+  btn.type = "button";
+  btn.setAttribute("aria-label", "Collapse or expand this section");
+  head.prepend(btn);
+  // The whole header is the hit target, but controls inside it must still work.
+  head.addEventListener("click", (e) => {
+    if (e.target.closest("button:not(.collapse), select, input, form, a")) return;
+    const id = panel.dataset.panel;
+    if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id);
+    savePrefs({ collapsed: [...collapsed] });
+    applyCollapsed();
+  });
+});
 
 function renderAccountPicker() {
   const sel = $("#account");
@@ -344,7 +569,7 @@ function renderAccountPicker() {
       `<option value="${esc(a.account_number)}">${esc(a.nickname)} · ${esc(a.account_number)} — ${money(a.net_liquidating_value)}</option>`),
   ];
   sel.innerHTML = opts.join("");
-  if (!DATA.views[account]) {
+  if (!viewSet()[account]) {
     // The remembered account is gone (closed, or excluded by TASTYTRADE_ACCOUNT).
     account = "ALL";
     savePrefs({ account });
@@ -352,8 +577,12 @@ function renderAccountPicker() {
   sel.value = account;
 }
 
+function viewSet() {
+  return exFutures && DATA.views_ex_futures ? DATA.views_ex_futures : DATA.views;
+}
+
 function renderView() {
-  const r = DATA.views[account];
+  const r = viewSet()[account];
   if (!r) return;
   REPORT = r;
 
@@ -388,7 +617,10 @@ function render(r) {
     warn.hidden = true;
   }
 
+  applyCollapsed();
   renderKpis(r);
+  renderPerformance(r);
+  renderEarnings(r);
   renderAllocation();
   renderCorrelation(r);
   renderRisk(r);
@@ -495,7 +727,9 @@ async function runWhatIf() {
   host.innerHTML = `<div class="empty">Fetching price history…</div>`;
   try {
     const res = await fetch(
-      `/api/whatif?account=${encodeURIComponent(account)}&symbols=${encodeURIComponent(symbols)}`);
+      `/api/whatif?account=${encodeURIComponent(account)}`
+      + `&ex_futures=${exFutures}`
+      + `&symbols=${encodeURIComponent(symbols)}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
     renderWhatIf(body);
@@ -514,7 +748,19 @@ function syncControls() {
     b.classList.toggle("is-active", b.dataset.key === tabKey));
   [...$("#basis").children].forEach((b) =>
     b.classList.toggle("is-active", b.dataset.basis === basis));
+  // The equities-only toggle is meaningless without futures in the book.
+  $("#futwrap").hidden = !DATA?.has_futures;
+  $("#exfutures").checked = exFutures;
+  $("#futwrap").classList.toggle("is-on", exFutures);
+  document.body.classList.toggle("ex-futures", exFutures);
 }
+
+$("#exfutures").addEventListener("change", (e) => {
+  exFutures = e.target.checked;
+  savePrefs({ ex_futures: exFutures });
+  renderAccountPicker();
+  renderView();
+});
 
 $("#account").addEventListener("change", (e) => {
   account = e.target.value;

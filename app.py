@@ -44,7 +44,15 @@ _lock = threading.Lock()
 # origin *including the port*, so a browser-side preference would never survive
 # a restart.
 PREFS_FILE = ROOT / "data" / "ui_state.json"
-DEFAULT_PREFS = {"account": "ALL", "tab": "by_symbol", "basis": "pct_of_gross"}
+DEFAULT_PREFS = {
+    "account": "ALL",
+    "tab": "by_symbol",
+    "basis": "pct_of_gross",
+    "ex_futures": False,
+    "sort": "notional",
+    "sort_dir": "desc",
+    "collapsed": [],  # panel ids the user has folded away
+}
 
 
 def read_prefs() -> dict:
@@ -122,7 +130,7 @@ def api_report(refresh: bool = False):
 
 
 @app.get("/api/whatif")
-def api_whatif(symbols: str = "", account: str = "ALL"):
+def api_whatif(symbols: str = "", account: str = "ALL", ex_futures: bool = False):
     """Correlation of prospective symbols against the current book.
 
     Weights come from the selected view's net notional, so the comparison is
@@ -139,7 +147,10 @@ def api_whatif(symbols: str = "", account: str = "ALL"):
         raise HTTPException(
             status_code=409, detail="Load the portfolio first, then try again."
         )
-    view = report.get("views", {}).get(account)
+    # Honour the "Equities only" toggle, so the comparison is against the same
+    # book the rest of the page is showing.
+    key = "views_ex_futures" if ex_futures else "views"
+    view = report.get(key, {}).get(account)
     if view is None:
         raise HTTPException(status_code=404, detail=f"Unknown account {account!r}.")
 

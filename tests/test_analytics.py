@@ -7,6 +7,7 @@ Run with: .venv/Scripts/python.exe -m pytest tests/ -q
 from __future__ import annotations
 
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -79,34 +80,61 @@ class FakeClient:
                 "symbol": "AAPL", "underlying_symbol": "AAPL",
                 "instrument_type": "Equity", "quantity": "100",
                 "quantity_direction": "Long", "multiplier": "1",
-                "close_price": "200", "mark_price": "200",
+                "close_price": "198", "mark_price": "200",
+                "average_open_price": "180",
             },
             {  # short 2 XOM puts -> notional 2 * 100 * 110 = $22,000 short
                 "symbol": "XOM  250117P00100000", "underlying_symbol": "XOM",
                 "instrument_type": "Equity Option", "quantity": "2",
                 "quantity_direction": "Short", "multiplier": "100",
-                "close_price": "3.50", "mark_price": "3.50",
+                "close_price": "3.60", "mark_price": "3.50",
+                "average_open_price": "5.00",
                 "expires_at": "2025-01-17T21:00:00Z",
             },
             {  # long 2 /ZN @ 110.5 -> notional 2 * 110.5 * 1000 = $221,000
                 "symbol": "/ZNZ4", "underlying_symbol": "/ZN",
                 "instrument_type": "Future", "quantity": "2",
                 "quantity_direction": "Long", "multiplier": "1",
-                "close_price": "110.5",
+                "close_price": "110.0", "average_open_price": "110.0",
             },
         ]
 
     def margin_requirements(self, account_number):
+        # Mirrors the real API: the margin report covers equities only. Futures
+        # margin arrives separately as futures_margin_requirement on balances.
         return {"groups": [
             {"underlying_symbol": "AAPL", "margin_requirement": "10000"},
             {"underlying_symbol": "XOM", "margin_requirement": "4000"},
-            {"underlying_symbol": "/ZN", "margin_requirement": "3000"},
         ]}
 
+    def net_liq_history(self, account_number, time_back="1y"):
+        """One point per calendar day, as the real endpoint returns.
+
+        Ends today so the date-based period returns can be exercised: 120 days
+        of history means 1m and 3m resolve but 6m and 1y are correctly omitted.
+        Values dip to a 110k peak then a 99k trough -> -10% max drawdown.
+        """
+        today = date.today()
+        series = []
+        for offset in range(119, -1, -1):
+            day = today - timedelta(days=offset)
+            if offset == 119:
+                close = 100000
+            elif offset == 100:
+                close = 110000
+            elif offset == 91:  # exactly the 3-month lookback point
+                close = 99000
+            else:
+                close = 105000
+            series.append({"time": f"{day.isoformat()} 00:00:00+00", "close": str(close)})
+        return series
+
     def market_metrics(self, symbols):
+        soon = (date.today() + timedelta(days=10)).isoformat()
         return [
             {"symbol": "AAPL", "beta": "1.25", "dividend_yield": "0.005",
-             "implied_volatility_index_rank": "0.30", "corr_spy_3month": "0.80"},
+             "implied_volatility_index_rank": "0.30", "corr_spy_3month": "0.80",
+             "earnings": {"expected_report_date": soon}},
             {"symbol": "XOM", "beta": "0.85", "dividend_yield": "0.033",
              "implied_volatility_index_rank": "0.45", "corr_spy_3month": "0.55"},
         ]
@@ -163,7 +191,11 @@ def run() -> int:
     exp = report["exposure"]
     check("gross notional", exp["gross_notional"], 263_000)  # 20k + 22k + 221k
     check("net notional", exp["net_notional"], 219_000)  # 20k - 22k + 221k
+    # 10k AAPL + 4k XOM from the margin report, + 3k futures margin attributed
+    # from balances (the margin report never includes futures).
     check("total margin", exp["total_margin"], 17_000)
+    zn_row = {r["name"]: r for r in report["allocation"]["by_symbol"]}["/ZN"]
+    check("futures margin attributed from balances", zn_row["margin"], 3_000)
 
     check("cash", report["cash"]["cash_balance"], 50_000)
     check("cash pct of net liq", report["cash"]["cash_pct_of_net_liq"], 20.0)
@@ -186,6 +218,33 @@ def run() -> int:
         failures.append(f"largest position: got {risk['largest_position']}, want /ZN")
     check("futures pct of gross", risk["futures_pct_of_gross"],
           221_000 / 263_000 * 100)
+
+    # --- P&L ---------------------------------------------------------------
+    perf = report["performance"]
+    check("unrealized pnl", perf["unrealized_pnl"], 3_300)   # 2000 + 300 + 1000
+    check("cost basis", perf["cost_basis"], 239_000)          # 18000 + 1000 + 220000
+    check("day pnl", perf["day_pnl"], 1_220)                  # 200 + 20 + 1000
+    check("short option pnl", pos["XOM  250117P00100000"]["unrealized_pnl"], 300)
+    if perf["winners"] != 3 or perf["losers"] != 0:
+        failures.append(f"winners/losers: {perf['winners']}/{perf['losers']}")
+    check("max drawdown", perf["max_drawdown_pct"], -10.0)    # 110k -> 99k
+    if len(perf["history"]) != 120:
+        failures.append(f"history points: {len(perf['history'])}")
+
+    # Periods are resolved by date, not by row count. With 120 calendar days of
+    # history, 1m and 3m are answerable and 6m/1y must be omitted rather than
+    # silently reported against the oldest available point.
+    if set(perf["returns"]) != {"1m", "3m"}:
+        failures.append(f"returns periods: got {sorted(perf['returns'])}, want 1m+3m")
+    check("3m return", perf["returns"].get("3m", 0), (105000 / 99000 - 1) * 100)
+    check("1m return", perf["returns"].get("1m", 0), 0.0)
+
+    # --- earnings ----------------------------------------------------------
+    earnings = report["earnings"]
+    if [e["symbol"] for e in earnings] != ["AAPL"]:
+        failures.append(f"earnings: got {earnings}")
+    elif earnings[0]["days_away"] != 10:
+        failures.append(f"earnings days_away: {earnings[0]['days_away']}")
 
     if report["warnings"]:
         failures.append(f"unexpected warnings: {report['warnings']}")

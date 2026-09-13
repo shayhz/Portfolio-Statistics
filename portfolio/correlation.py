@@ -354,3 +354,21 @@ class PriceHistory:
         portfolio_vol = float(portfolio.dropna().std()) * math.sqrt(252) * 100
         result["portfolio_volatility_pct"] = round(portfolio_vol, 2)
         return result
+
+    def volatility_for(self, symbol: str) -> float | None:
+        """Annualised volatility of daily returns, as a fraction (0.041 = 4.1%).
+
+        This is what puts positions on a comparable footing: notional treats a
+        dollar of 10-year note future the same as a dollar of micro-cap equity,
+        when the latter carries roughly 25x the risk.
+        """
+        series = self.returns_for(symbol)
+        if series is None:
+            return None
+        clean = series.dropna()
+        if len(clean) < MIN_OBSERVATIONS:
+            return None
+        import math
+
+        value = float(clean.std()) * math.sqrt(252)
+        return value if value == value else None
