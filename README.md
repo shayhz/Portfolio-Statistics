@@ -161,6 +161,30 @@ Symbols you already hold are skipped, and anything with no Yahoo history is repo
 rather than silently dropped. The price cache is incremental, so testing a new symbol
 downloads only that symbol.
 
+## Fetching
+
+Two things keep the load fast, both of which matter because request latency to
+tastytrade dominates the runtime:
+
+- **Only the selected account is fetched.** Picking one account skips the others'
+  positions, margin and net-liq history -- 11 requests instead of 17. Balances are
+  still fetched for every account, since the picker shows each one's net liq and a
+  balance call is the cheapest of the four. Each account's report is cached
+  separately, so switching back to one already viewed is instant.
+- **Requests run concurrently.** Every per-account call is independent, as are the
+  quote, metrics and futures-instrument lookups, so they are issued through a thread
+  pool (`MAX_WORKERS` in [portfolio/analytics.py](portfolio/analytics.py)) instead of
+  serially. Measured on a slow link, median wall clock:
+
+  | | sequential | concurrent | |
+  |---|---|---|---|
+  | All accounts | 71.8s | 25.1s | 2.9x |
+  | One account | 51.6s | 9.1s | 5.7x |
+
+  Results are collected in account order, so the report is byte-identical to the
+  sequential version. The OAuth token is minted under a double-checked lock, or every
+  thread noticing an expiring token would start its own exchange.
+
 ## Sector and industry data
 
 tastytrade's API does not return sector or industry, so equities are classified via

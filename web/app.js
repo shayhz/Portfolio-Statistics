@@ -582,7 +582,8 @@ function viewSet() {
 }
 
 function renderView() {
-  const r = viewSet()[account];
+  const set = viewSet();
+  const r = set[account] || set[DATA.selected] || set.ALL;
   if (!r) return;
   REPORT = r;
 
@@ -635,14 +636,21 @@ function render(r) {
 async function load(refresh = false) {
   const btn = $("#refresh");
   btn.disabled = true;
+  $("#account").disabled = true;
   const status = $("#status");
   if (!REPORT) {
     status.className = "status";
     status.textContent = "Querying tastytrade… (first run also looks up sectors, which can take a minute)";
     status.hidden = false;
+  } else {
+    // Keep the page on screen while the new account loads, rather than
+    // blanking everything the user was just looking at.
+    $("#stamp").textContent = "Loading…";
+    $("#main").classList.add("loading");
   }
   try {
-    const res = await fetch(`/api/report?refresh=${refresh ? "true" : "false"}`);
+    const res = await fetch(
+      `/api/report?refresh=${refresh ? "true" : "false"}&account=${encodeURIComponent(account)}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
     DATA = body;
@@ -656,6 +664,8 @@ async function load(refresh = false) {
     $("#main").hidden = true;
   } finally {
     btn.disabled = false;
+    $("#account").disabled = false;
+    $("#main").classList.remove("loading");
   }
 }
 
@@ -765,7 +775,9 @@ $("#exfutures").addEventListener("change", (e) => {
 $("#account").addEventListener("change", (e) => {
   account = e.target.value;
   savePrefs({ account });
-  renderView();
+  // Only the selected account's data is fetched, so switching needs a round
+  // trip. The server caches per account, so coming back to one is instant.
+  load(false);
 });
 
 $("#tabs").addEventListener("click", (e) => {

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -33,6 +34,10 @@ from portfolio.tasty import TastyClient, dec
 log = logging.getLogger(__name__)
 
 ZERO = Decimal(0)
+
+# These requests are independent and latency-bound, so they are issued
+# concurrently. Kept modest to stay well inside tastytrade's rate limits.
+MAX_WORKERS = 8
 
 OPTION_LIKE = {"Equity Option"}
 FUTURE_LIKE = {"Future"}
@@ -145,7 +150,18 @@ class PortfolioBuilder:
 
     # ------------------------------------------------------------- fetching
 
-    def build(self, account_numbers: list[str] | None = None) -> dict:
+    def build(
+        self,
+        account_numbers: list[str] | None = None,
+        selected: str = "ALL",
+    ) -> dict:
+        """Build the report.
+
+        `selected` limits the expensive per-account work (positions, margin and
+        net-liq history) to a single account. Balances are still fetched for
+        every account because the account picker shows each one's net liq, and
+        a balance call is cheap next to the other three.
+        """
         accounts = self.client.accounts()
         if account_numbers:
             wanted = {a.strip() for a in account_numbers if a.strip()}
@@ -153,21 +169,53 @@ class PortfolioBuilder:
         if not accounts:
             raise RuntimeError("No open tastytrade accounts found for this login.")
 
+        known = {a["account_number"] for a in accounts}
+        if selected != "ALL" and selected not in known:
+            selected = "ALL"
+        loaded = accounts if selected == "ALL" else [
+            a for a in accounts if a["account_number"] == selected
+        ]
+
         raw_positions: list[dict] = []
         balances: list[dict] = []
         margin_by_account: dict[str, dict] = {}
         history_by_account: dict[str, list] = {}
+        loaded_numbers = {a["account_number"] for a in loaded}
 
+        # Every per-account call is independent, so fan them out rather than
+        # paying the round-trip latency once per request in series.
+        jobs: dict[tuple[str, str], object] = {}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for acct in accounts:
+                number = acct["account_number"]
+                jobs[("balances", number)] = pool.submit(self.client.balances, number)
+                if number not in loaded_numbers:
+                    continue
+                jobs[("positions", number)] = pool.submit(self.client.positions, number)
+                jobs[("margin", number)] = pool.submit(
+                    self.client.margin_requirements, number
+                )
+                jobs[("history", number)] = pool.submit(
+                    self.client.net_liq_history, number
+                )
+
+        # Collected in account order so the report is identical every run.
         for acct in accounts:
             number = acct["account_number"]
-            bal = self.client.balances(number)
+            bal = jobs[("balances", number)].result()
             bal["nickname"] = acct.get("nickname") or number
             balances.append(bal)
-            for pos in self.client.positions(number):
+            if number not in loaded_numbers:
+                continue
+            for pos in jobs[("positions", number)].result():
                 pos["_account"] = number
                 raw_positions.append(pos)
-            margin_by_account[number] = self.client.margin_requirements(number)
-            history_by_account[number] = self.client.net_liq_history(number)
+            margin_by_account[number] = jobs[("margin", number)].result()
+            history_by_account[number] = jobs[("history", number)].result()
+
+        loaded_balances = [
+            b for b in balances if b.get("account_number") in loaded_numbers
+        ]
 
         self._load_reference_data(raw_positions)
         margins = self._margin_by_underlying(margin_by_account, balances, raw_positions)
@@ -202,11 +250,11 @@ class PortfolioBuilder:
         equities_only = [p for p in positions if not p.is_future]
 
         all_history = _combine_history(history_by_account)
-        views = {"ALL": self._assemble(accounts, balances, positions, all_history)}
+        views = {"ALL": self._assemble(loaded, loaded_balances, positions, all_history)}
         views_ex_futures = {
-            "ALL": self._assemble(accounts, balances, equities_only, all_history)
+            "ALL": self._assemble(loaded, loaded_balances, equities_only, all_history)
         }
-        for acct in accounts:
+        for acct in loaded:
             number = acct["account_number"]
             acct_balances = [b for b in balances if b.get("account_number") == number]
             acct_history = _combine_history({number: history_by_account.get(number, [])})
@@ -235,12 +283,14 @@ class PortfolioBuilder:
                         ),
                         0.0,
                     ),
+                    "loaded": a.get("account_number") in loaded_numbers,
                     "position_count": sum(
                         1 for p in positions if p.account == a.get("account_number")
-                    ),
+                    ) if a.get("account_number") in loaded_numbers else None,
                 }
                 for a in accounts
             ],
+            "selected": selected,
             "views": views,
             # Same shape, with futures and futures options removed, for the
             # "equities only" toggle in the UI.
@@ -266,18 +316,28 @@ class PortfolioBuilder:
                 equity_syms.add(underlying)
                 metric_syms.add(underlying)
 
-        quotes = self.client.market_data(
-            equities=sorted(equity_syms), futures=sorted(future_syms)
-        )
-        for quote in quotes:
+        # Quotes, metrics and each futures instrument are independent too.
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            quotes_job = pool.submit(
+                self.client.market_data,
+                equities=sorted(equity_syms),
+                futures=sorted(future_syms),
+            )
+            metrics_job = pool.submit(self.client.market_metrics, sorted(metric_syms))
+            future_jobs = {
+                symbol: pool.submit(self.client.future, symbol)
+                for symbol in sorted(future_syms)
+            }
+
+        for quote in quotes_job.result():
             self._quotes[quote.get("symbol", "")] = quote
 
-        for metric in self.client.market_metrics(sorted(metric_syms)):
+        for metric in metrics_job.result():
             self._metrics[metric.get("symbol", "")] = metric
 
-        for symbol in sorted(future_syms):
+        for symbol, job in future_jobs.items():
             try:
-                self._futures[symbol] = self.client.future(symbol)
+                self._futures[symbol] = job.result()
             except Exception as exc:  # noqa: BLE001 - proceed without the instrument
                 log.warning("Future instrument lookup failed for %s: %s", symbol, exc)
 
@@ -774,8 +834,12 @@ def _risk(
     }
 
 
-def build_report(client: TastyClient, account_numbers: list[str] | None = None) -> dict:
-    return PortfolioBuilder(client).build(account_numbers)
+def build_report(
+    client: TastyClient,
+    account_numbers: list[str] | None = None,
+    selected: str = "ALL",
+) -> dict:
+    return PortfolioBuilder(client).build(account_numbers, selected)
 
 
 def _combine_history(history_by_account: dict[str, list]) -> list[dict]:

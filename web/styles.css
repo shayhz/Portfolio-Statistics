@@ -313,3 +313,6 @@ body.ex-futures .topbar { box-shadow: inset 0 -2px 0 var(--warn); }
                padding-left: 8px; padding-right: 8px; }
 .earn.urgent .earn-sym, .earn.urgent .earn-when { color: var(--short); }
 .earn.near .earn-when { color: var(--warn); }
+
+/* Dim the page while a different account loads, instead of blanking it. */
+#main.loading { opacity: .45; pointer-events: none; transition: opacity .1s; }

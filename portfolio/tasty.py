@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -103,6 +104,9 @@ class TastyClient:
         self.base_url = CERT_URL if sandbox else API_URL
         self.access_token: str | None = None
         self._expires_at: float = 0.0
+        # Requests are issued concurrently, so the token must be minted once
+        # rather than by every thread that notices it has expired.
+        self._token_lock = threading.Lock()
 
     # ---------------------------------------------------------------- auth
 
@@ -140,13 +144,26 @@ class TastyClient:
         self._expires_at = time.monotonic() + expires_in
         log.info("OAuth access token obtained, valid for %ss.", int(expires_in))
 
+    def _valid_token(self) -> bool:
+        return bool(self.access_token) and (
+            time.monotonic() < self._expires_at - TOKEN_REFRESH_MARGIN
+        )
+
     def _ensure_token(self) -> None:
-        """Re-mint the access token if it is missing or about to expire."""
-        if self.access_token and time.monotonic() < self._expires_at - TOKEN_REFRESH_MARGIN:
+        """Re-mint the access token if it is missing or about to expire.
+
+        Double-checked under a lock: with concurrent requests, many threads can
+        see an expiring token at once, and without this each would start its own
+        OAuth exchange.
+        """
+        if self._valid_token():
             return
-        if self.access_token:
-            log.info("Access token near expiry; refreshing.")
-        self.login()
+        with self._token_lock:
+            if self._valid_token():
+                return  # another thread refreshed it while we waited
+            if self.access_token:
+                log.info("Access token near expiry; refreshing.")
+            self.login()
 
     def logout(self) -> None:
         # OAuth access tokens are short-lived and have no revoke endpoint here;
@@ -229,7 +246,9 @@ class TastyClient:
         # A token can still lapse between the check and the call; re-auth once.
         if status == 401:
             log.info("Got 401 on %s; re-authenticating and retrying once.", path)
-            self.login()
+            with self._token_lock:
+                if not self._valid_token():
+                    self.login()
             status, body = self._request("GET", path, params=params)
         self._raise_for_status(status, body, f"GET {path}")
         return body.get("data", {})
