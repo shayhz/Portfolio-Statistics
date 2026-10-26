@@ -25,8 +25,11 @@ a set of portfolio risk figures — with futures counted at true contract notion
    account, or set it to one account number (or a comma-separated list). Treat the
    secret and refresh token like a password — together they are account access.
 
-3. Double-click `run.bat`. On first run it creates `.venv` and installs dependencies,
-   then opens the dashboard in a desktop window.
+3. Double-click `run.bat`. On first run it creates a virtual environment in
+   `%LOCALAPPDATA%\PortfolioStatistics\venv` and installs dependencies, then opens
+   the dashboard in a desktop window. The venv is kept outside the project folder
+   so each computer the folder syncs to builds its own, and it is rebuilt
+   automatically if its Python goes missing or `requirements.txt` changes.
 
 Other ways to run it:
 
@@ -229,7 +232,7 @@ web/                    dashboard UI (no CDN dependencies; works offline)
 tests/                  offline checks of the exposure math
 ```
 
-Run the tests with `.venv\Scripts\python.exe tests\test_analytics.py`.
+Run the tests with `%LOCALAPPDATA%\PortfolioStatistics\venv\Scripts\python.exe tests\test_analytics.py`.
 
 Your selected account, allocation tab, allocation basis, equities-only toggle,
 positions-table sort and which panels you have collapsed are remembered in

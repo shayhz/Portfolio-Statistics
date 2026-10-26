@@ -1,6 +1,6 @@
 """Offline checks for the exposure math, using a stubbed API client.
 
-Run with: .venv/Scripts/python.exe -m pytest tests/ -q
+Run with: %LOCALAPPDATA%/PortfolioStatistics/venv/Scripts/python.exe -m pytest tests/ -q
 (or plain `python tests/test_analytics.py` for a quick pass/fail summary)
 """
 
