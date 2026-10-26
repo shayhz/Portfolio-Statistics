@@ -83,7 +83,7 @@ class FakeClient:
                 "close_price": "198", "mark_price": "200",
                 "average_open_price": "180",
             },
-            {  # short 2 XOM puts -> notional 2 * 100 * 110 = $22,000 short
+            {  # short 2 XOM puts, delta -0.30 -> -2 * -0.30 * 100 * 110 = $6,600 long
                 "symbol": "XOM  250117P00100000", "underlying_symbol": "XOM",
                 "instrument_type": "Equity Option", "quantity": "2",
                 "quantity_direction": "Short", "multiplier": "100",
@@ -144,6 +144,7 @@ class FakeClient:
         return [
             {"symbol": "AAPL", "mark": "200"},
             {"symbol": "XOM", "mark": "110"},
+            {"symbol": "XOM  250117P00100000", "mark": "3.50", "delta": "-0.30"},
             {"symbol": "/ZNZ4", "mark": "110.5"},
         ]
 
@@ -179,7 +180,7 @@ def run() -> int:
     check("AAPL market value", pos["AAPL"]["market_value"], 20_000)
 
     xom = pos["XOM  250117P00100000"]
-    check("short XOM put notional", xom["notional"], -22_000)  # 2 x 100 x 110, short
+    check("short XOM put notional", xom["notional"], 6_600)  # short put = long delta
     check("short XOM put market value", xom["market_value"], -700)  # premium only
 
     zn = pos["/ZNZ4"]
@@ -189,8 +190,8 @@ def run() -> int:
 
     # --- aggregates --------------------------------------------------------
     exp = report["exposure"]
-    check("gross notional", exp["gross_notional"], 263_000)  # 20k + 22k + 221k
-    check("net notional", exp["net_notional"], 219_000)  # 20k - 22k + 221k
+    check("gross notional", exp["gross_notional"], 247_600)  # 20k + 6.6k + 221k
+    check("net notional", exp["net_notional"], 247_600)  # all long
     # 10k AAPL + 4k XOM from the margin report, + 3k futures margin attributed
     # from balances (the margin report never includes futures).
     check("total margin", exp["total_margin"], 17_000)
@@ -202,22 +203,22 @@ def run() -> int:
 
     sectors = {r["name"]: r for r in report["allocation"]["by_sector"]}
     check("rates sector pct", sectors["Futures: Rates"]["pct_of_gross"],
-          221_000 / 263_000 * 100)
+          221_000 / 247_600 * 100)
     check("tech sector pct", sectors["Technology"]["pct_of_gross"],
-          20_000 / 263_000 * 100)
+          20_000 / 247_600 * 100)
     if "US Treasuries" not in {r["name"] for r in report["allocation"]["by_industry"]}:
         failures.append("industry: /ZN did not map to 'US Treasuries'")
 
     risk = report["risk"]
-    check("gross leverage", risk["gross_leverage"], 263_000 / 250_000)
+    check("gross leverage", risk["gross_leverage"], 247_600 / 250_000)
     check("beta weighted", risk["beta_weighted_notional"],
-          20_000 * 1.25 + (-22_000) * 0.85)  # /ZN has no beta, excluded
+          20_000 * 1.25 + 6_600 * 0.85)  # /ZN has no beta, excluded
     check("largest position pct", risk["largest_position_pct"],
-          221_000 / 263_000 * 100)
+          221_000 / 247_600 * 100)
     if risk["largest_position"] != "/ZN":
         failures.append(f"largest position: got {risk['largest_position']}, want /ZN")
     check("futures pct of gross", risk["futures_pct_of_gross"],
-          221_000 / 263_000 * 100)
+          221_000 / 247_600 * 100)
 
     # --- P&L ---------------------------------------------------------------
     perf = report["performance"]
@@ -299,9 +300,74 @@ def run() -> int:
     return 0
 
 
+class CalendarClient(FakeClient):
+    """AAPL 345 call calendar: short the near month, long the next."""
+
+    def positions(self, account_number):
+        return [
+            {"symbol": "AAPL  261106C00345000", "underlying_symbol": "AAPL",
+             "instrument_type": "Equity Option", "quantity": "1",
+             "quantity_direction": "Short", "multiplier": "100",
+             "mark_price": "7.60", "average_open_price": "7.00"},
+            {"symbol": "AAPL  261113C00345000", "underlying_symbol": "AAPL",
+             "instrument_type": "Equity Option", "quantity": "1",
+             "quantity_direction": "Long", "multiplier": "100",
+             "mark_price": "8.775", "average_open_price": "8.00"},
+        ]
+
+    def margin_requirements(self, account_number):
+        return {"groups": []}
+
+    def market_data(self, equities=None, options=None, futures=None,
+                    future_options=None, indices=None, cryptocurrencies=None):
+        return [
+            {"symbol": "AAPL", "mark": "343.62"},
+            {"symbol": "AAPL  261106C00345000", "mark": "7.60", "delta": "0.486"},
+            {"symbol": "AAPL  261113C00345000", "mark": "8.775", "delta": "0.512"},
+        ]
+
+
+def run_calendar() -> int:
+    """A calendar is close to delta-neutral, so it must not be sized like two
+    naked contracts. Before delta-adjusting and netting, each leg counted as
+    100 shares and the spread showed as 2 x $34k of gross exposure."""
+    builder = PortfolioBuilder(
+        CalendarClient(),
+        StubClassifier({"AAPL": ("Technology", "Consumer Electronics")}),
+        StubPrices(),
+    )
+    report = builder.build()["views"]["ALL"]
+    failures: list[str] = []
+
+    # (0.512 - 0.486) x 100 x 343.62 = $893.41 net long delta
+    want = (0.512 - 0.486) * 100 * 343.62
+    got = report["exposure"]["gross_notional"]
+    if not approx(got, want):
+        failures.append(f"calendar gross: got {got}, want {want}")
+    row = report["allocation"]["by_symbol"][0]
+    if not approx(row["gross_notional"], want):
+        failures.append(f"calendar by_symbol gross: got {row['gross_notional']}")
+    if row["direction"] != "Long":
+        failures.append(f"calendar direction: got {row['direction']}")
+    if report["warnings"]:
+        failures.append(f"unexpected warnings: {report['warnings']}")
+
+    if failures:
+        print("FAILED (calendar):")
+        for f in failures:
+            print("  -", f)
+        return 1
+    print("Calendar checks passed.")
+    return 0
+
+
 def test_analytics():
     assert run() == 0
 
 
+def test_calendar_is_netted():
+    assert run_calendar() == 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(run() or run_calendar())

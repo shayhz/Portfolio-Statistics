@@ -50,18 +50,21 @@ different questions:
 Notional is computed per instrument type:
 
 - **Stock** — quantity × price.
-- **Equity option** — quantity × 100 × *underlying* price. This is raw notional, **not
-  delta-adjusted**: a far out-of-the-money put counts its full nominal exposure. Treat
-  it as "what I'm on the hook for", not "my current directional risk".
+- **Equity option** — quantity × 100 × delta × *underlying* price: the share-equivalent
+  directional exposure. Delta comes from tastytrade's option quote; if it is missing,
+  the full nominal is used and the dashboard shows a warning.
 - **Future** — quantity × price × the contract's point value, taken from tastytrade's
   `notional-multiplier` and cross-checked against the table in
   [portfolio/futures.py](portfolio/futures.py). So 2× `/ZN` at 110.5 is
   2 × 110.5 × $1,000 = **$221,000**, not $221. If the API and the local table disagree,
   the dashboard shows a warning rather than silently using the wrong one.
-- **Future option** — quantity × underlying future price × that future's point value.
+- **Future option** — quantity × delta × underlying future price × that future's point
+  value.
 
-Allocation percentages are shares of **gross** notional (the sum of absolute
-exposures), so a hedged book never produces percentages over 100%. The **Margin**
+Allocation percentages are shares of **gross** notional. Legs on the same underlying
+are netted first, so a calendar, vertical or covered call counts as its net delta
+rather than as several naked positions. The absolute values are then summed across
+underlyings, so a hedged book never produces percentages over 100%. The **Margin**
 toggle re-bases the same breakdown on actual margin requirement per underlying.
 tastytrade's margin report covers equities only -- futures margin is reported once
 per account as `futures-margin-requirement`, so it is attributed across that
@@ -204,8 +207,9 @@ The first run is the slow one, because it looks up every symbol. After that it's
 
 ## Known limitations
 
-- Option notional is not delta-adjusted (no greeks are fetched). A delta-weighted view
-  would need the DXLink websocket streamer.
+- Option notional is delta-adjusted, which captures direction only. A delta-neutral
+  spread (a calendar, an iron condor) shows near-zero exposure even though it carries
+  gamma and vega risk. Check the **Margin** view for those.
 - Beta-weighting covers equities and equity options only; futures carry no beta in
   tastytrade's market metrics.
 - Prices are marks from tastytrade's REST quote endpoint, not a live stream — the

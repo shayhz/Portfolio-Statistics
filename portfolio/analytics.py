@@ -9,12 +9,15 @@ derivatives they answer different questions:
 
   notional     -- the economic exposure the position gives you. For an equity
                   that equals market value; for an option it is
-                  100 x underlying price (NOT delta-adjusted); for a future it
+                  delta x 100 x underlying price; for a future it
                   is price x the contract's point value, so one /ZN counts as
                   its full ~$110k of 10-year note exposure.
 
-Allocation percentages are computed against *gross* notional (the sum of
-absolute exposures), so a hedged book does not produce percentages over 100%.
+Allocation percentages are computed against *gross* notional: legs on the same
+underlying are netted first, then the absolute values are summed across
+underlyings. Netting is what keeps a calendar or covered call from counting as
+more exposure than a naked position, and summing absolutes across underlyings
+keeps a hedged book from producing percentages over 100%.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ class Position:
     underlying_price: Decimal | None
     market_value: Decimal
     notional: Decimal  # signed
+    delta: Decimal | None = None  # per contract, options only
     sector: str = "Unknown"
     industry: str = "Unknown"
     beta: Decimal | None = None
@@ -112,6 +116,33 @@ def _f(value: Decimal | None) -> float | None:
 
 def _pct(part: Decimal, whole: Decimal) -> float:
     return float(part / whole * 100) if whole else 0.0
+
+
+def _net_by_group(positions: list[Position]) -> dict[str, Decimal]:
+    """Signed notional per underlying, with its legs netted against each other.
+
+    The legs of a calendar, a vertical or a covered call largely offset, so
+    summing their absolute values would rate the spread as more exposure than
+    a naked position on the same underlying.
+    """
+    out: dict[str, Decimal] = defaultdict(Decimal)
+    for pos in positions:
+        out[pos.group_key] += pos.notional
+    return dict(out)
+
+
+def _gross(positions: list[Position]) -> Decimal:
+    return sum((abs(v) for v in _net_by_group(positions).values()), ZERO)
+
+
+def _netted_risk(positions: list[Position]) -> Decimal:
+    """Risk on the netted exposure: every leg of an underlying shares its vol."""
+    vols = {p.group_key: p.volatility for p in positions}
+    return sum(
+        (abs(net) * vols[key] for key, net in _net_by_group(positions).items()
+         if vols[key] is not None),
+        ZERO,
+    )
 
 
 def _signed_quantity(raw: dict) -> Decimal:
@@ -302,6 +333,9 @@ class PortfolioBuilder:
         equity_syms: set[str] = set()
         future_syms: set[str] = set()
         metric_syms: set[str] = set()
+        # Option quotes carry the greeks, which the delta-adjusted notional needs.
+        option_syms: set[str] = set()
+        future_option_syms: set[str] = set()
 
         for raw in raw_positions:
             itype = raw.get("instrument_type") or ""
@@ -310,9 +344,12 @@ class PortfolioBuilder:
             if itype in FUTURE_LIKE:
                 future_syms.add(symbol)
             elif itype in FUTURE_OPTION_LIKE:
+                future_option_syms.add(symbol)
                 if underlying:
                     future_syms.add(underlying)
             elif underlying:
+                if itype in OPTION_LIKE:
+                    option_syms.add(symbol)
                 equity_syms.add(underlying)
                 metric_syms.add(underlying)
 
@@ -321,7 +358,9 @@ class PortfolioBuilder:
             quotes_job = pool.submit(
                 self.client.market_data,
                 equities=sorted(equity_syms),
+                options=sorted(option_syms),
                 futures=sorted(future_syms),
+                future_options=sorted(future_option_syms),
             )
             metrics_job = pool.submit(self.client.market_metrics, sorted(metric_syms))
             future_jobs = {
@@ -404,6 +443,15 @@ class PortfolioBuilder:
                     return value
         return None
 
+    def _option_delta(self, symbol: str, warnings: list[str]) -> Decimal:
+        """Per-contract delta from the option's quote. Without one the full
+        nominal is used, which overstates spreads, so it is flagged."""
+        quote = self._quotes.get(symbol) or {}
+        if quote.get("delta") is not None:
+            return dec(quote["delta"])
+        warnings.append(f"No delta for {symbol}; notional is not delta-adjusted.")
+        return Decimal(1)
+
     def _notional_multiplier(self, symbol: str, warnings: list[str]) -> Decimal:
         """Point value for a futures contract, preferring the API's own figure."""
         api_value: Decimal | None = None
@@ -444,6 +492,7 @@ class PortfolioBuilder:
         multiplier = dec(raw.get("multiplier"), Decimal(1)) or Decimal(1)
 
         underlying_price: Decimal | None = None
+        delta: Decimal | None = None
         group_key = underlying
 
         if itype in FUTURE_LIKE:
@@ -462,7 +511,8 @@ class PortfolioBuilder:
             underlying_price = self._quote_price(underlying)
             point_value = self._notional_multiplier(underlying, warnings)
             if underlying_price:
-                notional = qty * underlying_price * point_value
+                delta = self._option_delta(symbol, warnings)
+                notional = qty * delta * underlying_price * point_value
             else:
                 notional = market_value
                 warnings.append(
@@ -474,7 +524,8 @@ class PortfolioBuilder:
             market_value = qty * price * multiplier
             underlying_price = self._quote_price(underlying)
             if underlying_price:
-                notional = qty * underlying_price * multiplier
+                delta = self._option_delta(symbol, warnings)
+                notional = qty * delta * underlying_price * multiplier
             else:
                 notional = market_value
                 warnings.append(
@@ -513,6 +564,7 @@ class PortfolioBuilder:
             underlying_price=underlying_price,
             market_value=market_value,
             notional=notional,
+            delta=delta,
             sector=sector,
             industry=industry,
             beta=beta,
@@ -534,8 +586,9 @@ class PortfolioBuilder:
         history: list[dict] | None = None,
     ) -> dict:
         totals = _totals(balances)
-        gross = sum((p.gross_notional for p in positions), ZERO)
-        net = sum((p.notional for p in positions), ZERO)
+        net_by_group = _net_by_group(positions)
+        gross = _gross(positions)
+        net = sum(net_by_group.values(), ZERO)
 
         # Margin is reported once per (account, underlying), so de-duplicate on
         # that pair before summing -- stock and its options share one figure,
@@ -549,7 +602,7 @@ class PortfolioBuilder:
         margin_by_group = dict(margin_by_group)
         total_margin = sum(margin_by_group.values(), ZERO)
 
-        total_risk = sum((p.risk for p in positions), ZERO)
+        total_risk = _netted_risk(positions)
 
         def grp(key_fn):
             return _group(positions, key_fn, gross, margin_by_group, total_margin, total_risk)
@@ -582,8 +635,8 @@ class PortfolioBuilder:
             "exposure": {
                 "gross_notional": float(gross),
                 "net_notional": float(net),
-                "long_notional": float(sum((p.notional for p in positions if p.notional > 0), ZERO)),
-                "short_notional": float(sum((p.notional for p in positions if p.notional < 0), ZERO)),
+                "long_notional": float(sum((v for v in net_by_group.values() if v > 0), ZERO)),
+                "short_notional": float(sum((v for v in net_by_group.values() if v < 0), ZERO)),
                 "total_margin": float(total_margin),
                 "total_risk": float(total_risk),
             },
@@ -615,6 +668,7 @@ class PortfolioBuilder:
                     "underlying_price": _f(p.underlying_price),
                     "market_value": _f(p.market_value),
                     "notional": _f(p.notional),
+                    "delta": _f(p.delta),
                     "pct_of_gross": _pct(p.gross_notional, gross),
                     "sector": p.sector,
                     "industry": p.industry,
@@ -683,9 +737,10 @@ def _group(
 
     rows = []
     for name, group in buckets.items():
-        group_gross = sum((p.gross_notional for p in group), ZERO)
-        group_net = sum((p.notional for p in group), ZERO)
-        group_risk = sum((p.risk for p in group), ZERO)
+        member_net = _net_by_group(group)
+        group_gross = sum((abs(v) for v in member_net.values()), ZERO)
+        group_net = sum(member_net.values(), ZERO)
+        group_risk = _netted_risk(group)
         group_cost = sum((p.cost_basis for p in group), ZERO)
         group_pnl = sum((p.unrealized_pnl for p in group), ZERO)
         # Notional-weighted volatility of the bucket's underlyings.
@@ -697,11 +752,7 @@ def _group(
 
         # The underlyings inside this bucket, largest first. Drives the hover
         # panel on the sector and industry views.
-        member_totals: dict[str, Decimal] = defaultdict(Decimal)
-        member_net: dict[str, Decimal] = defaultdict(Decimal)
-        for pos in group:
-            member_totals[pos.group_key] += pos.gross_notional
-            member_net[pos.group_key] += pos.notional
+        member_totals = {key: abs(value) for key, value in member_net.items()}
         members = [
             {
                 "name": key,
@@ -758,19 +809,24 @@ def _risk(
 ) -> dict:
     net_liq = Decimal(str(totals["net_liquidating_value"]))
 
+    # Gross exposure per underlying, legs netted, as the basis for every weight.
+    by_group = {key: abs(value) for key, value in _net_by_group(positions).items()}
+    first = {}
+    for pos in positions:
+        first.setdefault(pos.group_key, pos)
+
     # Beta-weighted exposure: each position's notional scaled by its beta to SPY.
     beta_weighted = ZERO
     beta_covered = ZERO
     for pos in positions:
         if pos.beta is not None:
             beta_weighted += pos.notional * pos.beta
-            beta_covered += pos.gross_notional
+    for key, value in by_group.items():
+        if first[key].beta is not None:
+            beta_covered += value
 
     # Herfindahl-Hirschman concentration index on gross notional (0-10000).
     hhi = ZERO
-    by_group: dict[str, Decimal] = defaultdict(Decimal)
-    for pos in positions:
-        by_group[pos.group_key] += pos.gross_notional
     if gross:
         for value in by_group.values():
             share = value / gross * 100
@@ -785,11 +841,10 @@ def _risk(
     ivr_base = ZERO
     corr_weighted = ZERO
     corr_base = ZERO
-    for pos in positions:
-        metric = metrics.get(pos.underlying)
+    for key, weight in by_group.items():
+        metric = metrics.get(first[key].underlying)
         if not metric:
             continue
-        weight = pos.gross_notional
         if metric.get("dividend_yield") is not None:
             div_weighted += dec(metric["dividend_yield"]) * weight
             div_base += weight
@@ -824,10 +879,8 @@ def _risk(
         "weighted_spy_correlation": float(corr_weighted / corr_base) if corr_base else None,
         "option_position_count": len(option_positions),
         "future_position_count": len(future_positions),
-        "futures_notional": float(sum((p.gross_notional for p in future_positions), ZERO)),
-        "futures_pct_of_gross": _pct(
-            sum((p.gross_notional for p in future_positions), ZERO), gross
-        ),
+        "futures_notional": float(_gross(future_positions)),
+        "futures_pct_of_gross": _pct(_gross(future_positions), gross),
         "nearest_expiration": min(
             (p.expires_at for p in positions if p.expires_at), default=None
         ),
@@ -994,7 +1047,10 @@ def _upcoming_earnings(positions: list[Position], days_ahead: int = 60) -> list[
                 "has_options": False,
             },
         )
-        row["gross_notional"] += float(pos.gross_notional)
+        # Accumulated signed so a spread's legs offset; made absolute below.
+        row["gross_notional"] += float(pos.notional)
         if "Option" in pos.instrument_type:
             row["has_options"] = True
+    for row in by_symbol.values():
+        row["gross_notional"] = abs(row["gross_notional"])
     return sorted(by_symbol.values(), key=lambda r: (r["days_away"], -r["gross_notional"]))
